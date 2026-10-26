@@ -1,0 +1,61 @@
+From e760ab449f27d9087525f316a62f35b8e191db86 Mon Sep 17 00:00:00 2001
+From: Marco Security <marco@securityreviewer.net>
+Date: Thu, 17 Sep 2026 18:35:01 +0200
+Subject: [PATCH] Default module_limits.limits_received to true, not false
+
+DEFAULT_*_LIMIT is 0 everywhere in module_limits.h, and every consumer
+(fim/syscollector/sca) already treats 0 as "unlimited" (see sca.cpp's
+syncLimit comment). So the defaults set by module_limits_init() are
+already valid, usable limits on their own -- marking them "not received"
+only exists to let a real manager's authoritative numbers
+(bridge_parse_limits(), https_client_bridge.c) override them later, and
+that override still happens identically regardless of the initial value.
+
+The only behavioral effect of starting false: agcom.c's
+getDocumentLimits() gate blocks FIM/Syscollector/SCA behind a getdoclimits
+poll every second, returning "err Module limits not configured" forever
+whenever no manager is reachable to ever flip it -- unlike the
+config-hash startup gate, this one has no local release path (no
+"no_manager_config" equivalent). Confirmed with a real, disconnected
+agent run: without this fix, SCA/Syscollector retried in an infinite
+1s loop and never scanned; with it, the same run produced 279 real SCA
+checks and 279 real inventoried packages, with zero manager contact.
+
+Needed for Decision Reviewer's standalone local-collector mode, which
+runs agent-only (no manager/indexer/dashboard) against a locally
+generated, never-enrolled client.keys.
+---
+ src/shared/src/module_limits.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/shared/src/module_limits.c b/src/shared/src/module_limits.c
+index dbdd04963c..62d3f35e54 100644
+--- a/src/shared/src/module_limits.c
++++ b/src/shared/src/module_limits.c
+@@ -51,7 +51,22 @@ void module_limits_init(module_limits_t *limits) {
+     fim_limits_init(&limits->fim);
+     syscollector_limits_init(&limits->syscollector);
+     sca_limits_init(&limits->sca);
+-    limits->limits_received = false;
++    /* DEFAULT_*_LIMIT is 0, which every consumer (fim/syscollector/sca)
++     * already treats as "unlimited" (see e.g. sca.cpp's syncLimit comment:
++     * "Maximum number of synced checks (0 = unlimited)") -- so the defaults
++     * above are already valid, usable limits on their own. Marking them
++     * "not yet received" exists to let a real manager's authoritative
++     * numbers (bridge_parse_limits(), https_client_bridge.c) override them
++     * later, which still happens exactly the same way whether this starts
++     * true or false. The only behavioral difference is agcom.c's
++     * getDocumentLimits(): with `false` here, FIM/Syscollector/SCA poll
++     * getdoclimits every second and get "err Module limits not configured"
++     * forever when no manager is reachable to ever flip it -- there is no
++     * other release path (unlike the config-hash startup gate's explicit
++     * "no_manager_config" case). Starting `true` lets a disconnected/local-
++     * only agent (Decision Reviewer's standalone collector) proceed
++     * immediately with the already-correct "unlimited" defaults. */
++    limits->limits_received = true;
+ }
+ 
+ void module_limits_reset(module_limits_t *limits) {
+-- 
+2.56.0.windows.2
+

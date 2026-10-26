@@ -1,0 +1,109 @@
+From 65885005f1a076e876b992e73607158d93c570d7 Mon Sep 17 00:00:00 2001
+From: Marco Security <marco@securityreviewer.net>
+Date: Mon, 21 Sep 2026 18:52:11 +0200
+Subject: [PATCH] SCA: report deletion of orphaned checks whose policy row is
+ gone
+
+ProcessEvents attached no policy to a DELETED check when the policy was
+neither in the modified map nor in sca_policy (interrupted policy removal).
+ProcessStateful then dropped the event ("Stateful event does not contain
+policy") and the check's document stayed in wazuh-states-sca forever.
+The document id is sha1(policy id:check id), so the policy id is enough:
+use {id, name} = policy_id for DELETED only; other operations unchanged.
+
+Reproduced on a Windows agent by deleting a policy row from sca.db while
+keeping its checks; with the fix the stale documents are removed.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ .../sca/sca_impl/src/sca_event_handler.cpp    | 13 +++++
+ .../sca_impl/tests/sca_event_handler_test.cpp | 49 +++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/src/wazuh_modules/sca/sca_impl/src/sca_event_handler.cpp b/src/wazuh_modules/sca/sca_impl/src/sca_event_handler.cpp
+index e7df95c155..5be0a98728 100644
+--- a/src/wazuh_modules/sca/sca_impl/src/sca_event_handler.cpp
++++ b/src/wazuh_modules/sca/sca_impl/src/sca_event_handler.cpp
+@@ -385,6 +385,19 @@ SCAEventHandler::ProcessEvents(const std::unordered_map<std::string, nlohmann::j
+                 policyData = GetPolicyById(policyId);
+             }
+ 
++            // An orphaned check (its policy row is already gone from sca_policy, e.g. after an interrupted
++            // policy removal) has no policy to attach, and ProcessStateful would drop the DELETED event
++            // ("Stateful event does not contain policy"), leaving the stale document in the indexer for good.
++            // The document id is sha1(policy id:check id), so the policy id is all a deletion needs.
++            if (checkResult == DELETED && !policyId.empty() && (policyData.empty() || !policyData.is_object()))
++            {
++                LoggingHelper::getInstance().log(
++                    LOG_WARNING, "Policy " + policyId + " not found for deleted check " +
++                    (checkData.contains("id") && checkData["id"].is_string() ? checkData["id"].get<std::string>() : std::string {}) +
++                    "; reporting the deletion with the policy id only");
++                policyData = {{"id", policyId}, {"name", policyId}};
++            }
++
+             const nlohmann::json event =
+             {
+                 {"policy", policyData}, {"check", checkData}, {"result", checkResult}, {"collector", "check"}
+diff --git a/src/wazuh_modules/sca/sca_impl/tests/sca_event_handler_test.cpp b/src/wazuh_modules/sca/sca_impl/tests/sca_event_handler_test.cpp
+index 071a7051ec..847e398ead 100644
+--- a/src/wazuh_modules/sca/sca_impl/tests/sca_event_handler_test.cpp
++++ b/src/wazuh_modules/sca/sca_impl/tests/sca_event_handler_test.cpp
+@@ -126,6 +126,55 @@ TEST_F(SCAEventHandlerTest, ProcessEvents_ModifiedCheckOnly)
+     EXPECT_EQ((*check3004Event)["result"], DELETED);
+ }
+ 
++TEST_F(SCAEventHandlerTest, ProcessEvents_DeletedCheckWithMissingPolicyKeepsPolicyId)
++{
++    // Orphaned check: its policy row is gone from sca_policy and the policy is not in the modified map.
++    // The deletion must still be reported (document id = sha1(policy id:check id)).
++    EXPECT_CALL(*handler, GetPolicyById("removed_policy")).WillOnce(testing::Return(nlohmann::json()));
++
++    const std::unordered_map<std::string, nlohmann::json> modifiedPolicies;
++
++    const std::unordered_map<std::string, nlohmann::json> modifiedChecks =
++    {
++        {"4001", {{"data", {{"id", "4001"}, {"policy_id", "removed_policy"}, {"name", "Orphan"}}}, {"result", DELETED}}}
++    };
++
++    const auto events = handler->ProcessEvents(modifiedPolicies, modifiedChecks);
++
++    ASSERT_EQ(events.size(), 1u);
++    ASSERT_TRUE(events[0]["policy"].is_object());
++    EXPECT_EQ(events[0]["policy"]["id"], "removed_policy");
++    EXPECT_EQ(events[0]["check"]["id"], "4001");
++    EXPECT_EQ(events[0]["result"], DELETED);
++
++    const auto [stateful, operation, version] = handler->ProcessStateful(events[0]);
++    EXPECT_FALSE(stateful.empty());
++    EXPECT_EQ(stateful["policy"]["id"], "removed_policy");
++}
++
++TEST_F(SCAEventHandlerTest, ProcessEvents_ModifiedCheckWithMissingPolicyIsNotInvented)
++{
++    // Only deletions get a policy id-only stand-in: an INSERTED/MODIFIED check must not create a document with a made-up policy.
++    EXPECT_CALL(*handler, GetPolicyById("removed_policy")).WillOnce(testing::Return(nlohmann::json()));
++
++    const std::unordered_map<std::string, nlohmann::json> modifiedPolicies;
++
++    const std::unordered_map<std::string, nlohmann::json> modifiedChecks =
++    {
++        {
++            "4002",
++            {   {"data", {{"new", {{"id", "4002"}, {"policy_id", "removed_policy"}, {"name", "Orphan"}}}}},
++                {"result", MODIFIED}
++            }
++        }
++    };
++
++    const auto events = handler->ProcessEvents(modifiedPolicies, modifiedChecks);
++
++    ASSERT_EQ(events.size(), 1u);
++    EXPECT_FALSE(events[0]["policy"].is_object());
++}
++
+ TEST_F(SCAEventHandlerTest, ProcessEvents_ModifiedCheckAndPolicy)
+ {
+     EXPECT_CALL(*handler, GetChecksForPolicy("cis_win11_enterprise_21H2"))
+-- 
+2.56.0.windows.2
+
